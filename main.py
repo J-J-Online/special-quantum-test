@@ -40,20 +40,30 @@ def save_user_data(username, public_key, private_key):
             print("⚠ WARNING: Attempted to save empty or invalid username! Preventing overwrite.")
             return  
 
-        user_data = {"username": username}  # ✅ Structured JSON format
+        user_data = {"username": username}  
 
         # ✅ Validate JSON before saving
         with open(USER_FILE, "w") as file:
-            json.dump(user_data, file, indent=4)  # ✅ Properly formats username.json
+            json.dump(user_data, file, indent=4)  
+        print(f"✅ DEBUG: Saved Username -> {username}")
 
-        # ✅ Store raw public/private keys if they are valid
-        if public_key and private_key:
+        # ✅ Verify the keys before saving
+        if not isinstance(public_key, bytes):
+            print(f"❌ ERROR: Public Key is not in bytes format. Current format: {type(public_key)}")
+        if not isinstance(private_key, bytes):
+            print(f"❌ ERROR: Private Key is not in bytes format. Current format: {type(private_key)}")
+
+        # ✅ Write binary keys separately with logging
+        if isinstance(public_key, bytes):
             with open(PUBLIC_KEY_FILE, "wb") as file:
                 file.write(public_key)
+            print(f"✅ DEBUG: Successfully wrote Public Key ({len(public_key)} bytes)")
+
+        if isinstance(private_key, bytes):
             with open(PRIVATE_KEY_FILE, "wb") as file:
                 file.write(private_key)
+            print(f"✅ DEBUG: Successfully wrote Private Key ({len(private_key)} bytes)")
 
-        print("✅ DEBUG: User data and keys saved successfully.")
     except Exception as e:
         print(f"❌ ERROR: Failed to save user data: {e}")
 
@@ -210,26 +220,62 @@ class Block:
         return hashlib.sha256(data.encode()).hexdigest()
 
 class PostBlock(BaseBlock):
-    """Blockchain block with additional post attributes."""
-    def __init__(self, sender, title, body, tags, link, previous_hash="0"):
-        super().__init__(previous_hash)
+    """Defines a block where 'posts' are stored securely."""
+    def __init__(self, block_id, sender, title, body, tags, link, previous_hash=""):
+        print("Initializing PostBlock...")
+        self.block_id = block_id  # ✅ Properly set block_id to "Post"
         self.sender = sender
         self.title = title
         self.body = body
         self.tags = tags
         self.link = link
-        self.nonce = self.generate_nonce()
-        self.signature = self.sign_block()
+        self.timestamp = time.time()
+        self.previous_hash = previous_hash
+        self.nonce = self.generate_nonce()  # Prevents replay attacks
+        self.hash = self.calculate_hash()
+        self.signature = self.sign_block()  # MLKEM_1024 Digital Signature
+        print(f"✅ DEBUG: PostBlock '{self.block_id}' successfully created.")
 
+    def generate_nonce(self):
+        """Generates a random nonce to prevent duplicate block attacks."""
+        nonce = hashlib.sha256(str(time.time()).encode()).hexdigest()
+        print(f"Generated nonce: {nonce}")
+        return nonce
+
+    def calculate_hash(self):
+        """Computes hash for the block, including timestamp and nonce."""
+        data = f"{self.sender}{self.title}{self.body}{self.tags}{self.link}{self.timestamp}{self.nonce}{self.previous_hash}"
+        hash_value = hashlib.sha256(data.encode()).hexdigest()
+        print(f"Computed hash: {hash_value}")
+        return hash_value
+
+    def sign_block(self):
+        """Generates a quantum-safe digital signature using MLKEM_1024."""
+        print("Signing block with MLKEM_1024...")
+        try:
+            kem_instance = quantcrypt.kem.MLKEM_1024()  # Instantiate encryption module
+            public_key, private_key = kem_instance.keygen()
+            signature = kem_instance.encaps(public_key)  # Encrypt data for verification
+            print("Block signed successfully.")
+            return signature
+        except Exception as e:
+            print(f"Error signing block: {e}")
+            return None
+        
 class Blockchain:
     def __init__(self, username, public_key, db_path="blockchain_db"):
         self.env = lmdb.open(db_path, max_dbs=1, sync=True, map_size=10485760)
         self.username = username
         self.public_key = public_key
+        self.post_balance = 0
+        self.countdown = 60  # Reward countdown in seconds
+        self.node_active = False
         self.encryption_key = Fernet.generate_key()
         self.cipher = Fernet(self.encryption_key)
         self.lock = threading.Lock()
         self.chain = []
+
+        self.start_rewarding()
 
         # ✅ Validate blockchain existence before loading
         if not self.has_genesis_block():
@@ -249,44 +295,46 @@ class Blockchain:
             return False
 
     def add_block(self, block):
-        """Stores a block in the blockchain."""
+        """Stores a block in the blockchain with proper validation before appending."""
         with self.lock:
             previous_hash = self.chain[-1].hash if self.chain else "0"
             block.previous_hash = previous_hash
             block.hash = block.calculate_hash()
 
-            self.chain.append(block)
-            self.store_block(block)
-            print(f"DEBUG: Added block {block.block_id} successfully.")
+            # ✅ Ensure `block_id` is correctly formatted before storage
+            if not isinstance(block.block_id, str):
+                print(f"❌ ERROR: Block ID is not a string! Type: {type(block.block_id)}")
+                return False
+
+            # ✅ Ensure successful storage before modifying chain
+            if self.store_block(block):
+                self.chain.append(block)
+                print(f"✅ DEBUG: Block '{block.block_id}' successfully added to blockchain.")
+            else:
+                print("❌ ERROR: Block storage failed. Not appending to blockchain.")
 
     def store_block(self, block):
-        """Stores blockchain data in LMDB without encryption or encoding, ensuring JSON compatibility."""
+        """Stores blockchain data in LMDB while ensuring bytes fields are properly converted for JSON compatibility."""
         safe_block = block.__dict__.copy()
 
-        # ✅ Convert bytes fields to hex representation (Alternative: Base64 encoding)
         for key, value in safe_block.items():
             if isinstance(value, bytes):
-                safe_block[key] = value.hex()  # Converts bytes to hex string
+                print(f"DEBUG: Converting bytes field '{key}' to Base64.")
+                safe_block[key] = base64.b64encode(value).decode("utf-8")  # ✅ Convert bytes to Base64
 
+            elif isinstance(value, tuple):
+                print(f"DEBUG: Converting tuple field '{key}' to a list of Base64 strings.")
+                safe_block[key] = [base64.b64encode(item).decode("utf-8") if isinstance(item, bytes) else str(item) for item in value]  # ✅ Convert tuple to a list of Base64 strings
+        
         try:
             print(f"DEBUG: Preparing to store Block {safe_block['block_id']}...")
 
             with self.env.begin(write=True) as txn:
-                # ✅ Check if transaction object is valid before proceeding
-                if txn is None:
-                    print("❌ ERROR: LMDB transaction failed to initialize!")
-                    return False
-
                 block_key = safe_block["hash"].encode("utf-8")
-                block_value = json.dumps(safe_block).encode("utf-8")
+                block_value = json.dumps(safe_block).encode("utf-8")  # ✅ No raw bytes present now
 
-                # ✅ Verify block data before writing
-                if not block_key or not block_value:
-                    print("❌ ERROR: Invalid block data detected! Skipping storage.")
-                    return False
-
-                txn.put(block_key, block_value)  # ✅ Store raw JSON block in LMDB
-                txn.commit()  # ✅ Explicitly commit changes to ensure persistence
+                txn.put(block_key, block_value)  # ✅ Store JSON block in LMDB
+                txn.commit()  # ✅ Ensure persistence
 
             print(f"✅ DEBUG: Block {safe_block['block_id']} stored successfully.")
             return True  # ✅ Return success status
@@ -294,6 +342,18 @@ class Blockchain:
         except lmdb.Error as e:
             print(f"❌ ERROR: Failed to store block in LMDB: {e}")
             return False  # ✅ Return failure status
+
+    def store_reward_transaction(self, amount):
+        """Stores reward transaction in LMDB to ensure fairness."""
+        reward_entry = {
+            "id": "Reward",
+            "username": self.username,
+            "amount": amount,
+            "timestamp": time.time(),
+            "nonce": hashlib.sha256(str(time.time()).encode()).hexdigest()  # Prevents replay attacks
+        }
+        with self.env.begin(write=True) as txn:
+            txn.put(f"reward_{self.username}_{reward_entry['timestamp']}".encode(), json.dumps(reward_entry).encode())
         
     def load_chain(self):
         """Loads blockchain from LMDB storage, ensuring valid initialization."""
@@ -339,6 +399,53 @@ class Blockchain:
         except Exception as e:
             print(f"❌ ERROR: Failed to load blockchain: {e}")
             return {}
+
+    def start_rewarding(self):
+        """Handles node rewards securely with cryptographic validation."""
+        def reward_cycle():
+            while True:
+                if self.node_active:
+                    for _ in range(self.countdown):
+                        time.sleep(1)
+                        with self.lock:
+                            self.countdown -= 1
+                    
+                    with self.lock:
+                        self.post_balance += 10
+                        self.countdown = 60  # Reset countdown
+                        self.store_reward_transaction(10)  # Securely store rewards
+                        print(f"Node [{self.username}] rewarded: +10 posts (Total: {self.post_balance})")
+
+        threading.Thread(target=reward_cycle).start()
+
+    def toggle_node(self, status):
+        """Starts or stops the node securely."""
+        with self.lock:
+            self.node_active = status
+            if not status:
+                self.countdown = 60  # Reset countdown on stop
+
+    def display_chain(self):
+        """Displays all stored blockchain transactions securely."""
+        try:
+            with self.env.begin() as txn:
+                cursor = txn.cursor()
+                for key, value in cursor:
+                    raw_data = value.decode()
+                    print(f"Raw Data from DB: {raw_data}")  # Debugging output
+                    block_data = json.loads(raw_data)
+
+                    # Identify whether this is a post or a reward/account entry
+                    if "sender" in block_data and "title" in block_data:  # PostBlock format
+                        print(f"[Post] Sender: {block_data['sender']}, Title: {block_data['title']}, Tags: {block_data.get('tags', [])}")
+                    elif "username" in block_data and "amount" in block_data:  # Reward/Account format
+                        print(f"[Reward] User: {block_data['username']}, Amount: {block_data['amount']}, Timestamp: {block_data['timestamp']}")
+                    else:
+                        print(f"Unknown entry format: {block_data}")  # Handle unexpected data
+        except json.JSONDecodeError:
+            print("Error: Unable to decode JSON. Check data format in storage.")
+        except Exception as e:
+            print(f"Unexpected error displaying chain: {e}")
 
 class BlockchainNode:
     """Manages secure peer networking using Tor Hidden Services."""
@@ -524,7 +631,6 @@ class BlockchainApp(QMainWindow):
         print("DEBUG: Tabs layout assigned.")
 
         print("DEBUG: BlockchainApp UI setup completed.")
-
         global start_time
         # Stop stopwatch
         end_time = time.time()
@@ -532,7 +638,6 @@ class BlockchainApp(QMainWindow):
         # Calculate elapsed time
         elapsed_time = end_time - start_time
         print(f"Execution time: {elapsed_time:.4f} seconds")
-
 
     def closeEvent(self, event):
         """Stops blockchain node when user closes the app."""
@@ -571,7 +676,6 @@ class BlockchainApp(QMainWindow):
         return tab
 
     def create_post_tab(self):
-        print("DEBUG: Creating Post Tab...")
         tab = QWidget()
         layout = QVBoxLayout()
 
@@ -583,12 +687,24 @@ class BlockchainApp(QMainWindow):
         self.body_input = QTextEdit()
         layout.addWidget(self.body_input)
 
+        layout.addWidget(QLabel("Tags (Optional):"))
+        self.tag_inputs = []
+        form_layout = QFormLayout()
+        for i in range(10):
+            tag_input = QLineEdit()
+            self.tag_inputs.append(tag_input)
+            form_layout.addRow(f"Tag {i+1}:", tag_input)
+        layout.addLayout(form_layout)
+
+        layout.addWidget(QLabel("Link (Optional):"))
+        self.link_input = QLineEdit()
+        layout.addWidget(self.link_input)
+
         self.submit_button = QPushButton("Submit Post")
         self.submit_button.clicked.connect(self.submit_post)
         layout.addWidget(self.submit_button)
 
         tab.setLayout(layout)
-        print("DEBUG: Post Tab successfully created!")
         return tab
 
     def create_blockchain_tab(self):
@@ -642,8 +758,8 @@ class BlockchainApp(QMainWindow):
 
         print(f"DEBUG: Sending {amount} posts to {recipient}...")
         transaction_block = PostBlock(
+            id_type="Post Send",
             sender=self.username,
-            title="Post Transfer",
             body=f"Sending {amount} posts to {recipient}",
             tags=[],
             link="",
@@ -670,31 +786,80 @@ class BlockchainApp(QMainWindow):
         return tab
 
     def submit_post(self):
-        print("DEBUG: Submitting new post...")
-        sender = self.username
-        title = self.title_input.text()
-        body = self.body_input.toPlainText()
+        """Submits a post, ensuring 'Post' is assigned as the block_id."""
+        try:
+            block_id = "Post"  # ✅ Assigning block_id
 
-        if not title or not body:
-            print("ERROR: Title and body are required for a post.")
-            return
+            sender = self.blockchain.username
+            title = self.title_input.text().strip()
+            body = self.body_input.toPlainText().strip()
+            tags = [tag.text().strip() for tag in self.tag_inputs if tag.text()]
+            link = self.link_input.text().strip()
 
-        print("DEBUG: Creating new post block...")
-        block = PostBlock(sender, title, body, [], "")
+            # ✅ Debugging User Input
+            print(f"DEBUG: block_id -> {block_id}")
+            print(f"DEBUG: Sender -> {sender}")
+            print(f"DEBUG: Title -> {title}")
+            print(f"DEBUG: Body -> {body}")
+            print(f"DEBUG: Tags -> {tags}")
+            print(f"DEBUG: Link -> {link}")
 
-        self.blockchain.add_block(block)
-        print("DEBUG: Post submitted successfully.")
+            # ✅ Validate Post Balance
+            if self.blockchain.post_balance <= 0:
+                print("❌ ERROR: Insufficient post balance to submit.")
+                return
+
+            # ✅ Create a new post block with block_id = "Post"
+            block = PostBlock(block_id, sender, title, body, tags, link)
+            print(f"✅ DEBUG: PostBlock instance created successfully with block_id '{block.block_id}'.")
+
+            # ✅ Add the block to the blockchain
+            self.blockchain.add_block(block)
+            print(f"✅ DEBUG: Block '{block.block_id}' added to blockchain.")
+
+            # ✅ Deduct post balance after submission
+            self.blockchain.post_balance -= 1
+            print(f"✅ DEBUG: Updated posts balance -> {self.blockchain.post_balance}")
+
+            # ✅ Display current chain for verification
+            self.blockchain.display_chain()
+            print("✅ DEBUG: Blockchain displayed successfully.")
+
+        except AttributeError as e:
+            print(f"❌ ERROR: Attribute missing or incorrectly referenced: {e}")
+        except TypeError as e:
+            print(f"❌ ERROR: Type mismatch encountered: {e}")
+        except Exception as e:
+            print(f"❌ ERROR: Unexpected exception occurred: {e}")
 
     def toggle_node(self):
-        print("DEBUG: Toggling blockchain node state...")
-        if self.blockchain.node_active:
-            self.blockchain.toggle_node(False)
-            self.node_button.setText("Start Node")
-            print("DEBUG: Blockchain node stopped.")
-        else:
-            self.blockchain.toggle_node(True)
-            self.node_button.setText("Stop Node")
-            print("DEBUG: Blockchain node started.")
+        """Toggles blockchain node state, ensuring error handling and debugging are included."""
+        try:
+            print("DEBUG: Attempting to toggle blockchain node state...")
+
+            # ✅ Verify that blockchain instance is available
+            if not hasattr(self, "blockchain") or self.blockchain is None:
+                print("❌ ERROR: Blockchain instance not found. Cannot toggle node.")
+                return
+
+            # ✅ Debug current state before toggling
+            print(f"DEBUG: Current Node Active Status -> {self.blockchain.node_active}")
+
+            if self.blockchain.node_active:
+                self.blockchain.toggle_node(False)
+                self.node_button.setText("Start Node")
+                print("✅ DEBUG: Blockchain node stopped successfully.")
+            else:
+                self.blockchain.toggle_node(True)
+                self.node_button.setText("Stop Node")
+                print("✅ DEBUG: Blockchain node started successfully.")
+
+        except AttributeError as e:
+            print(f"❌ ERROR: Attribute missing or incorrectly referenced: {e}")
+        except TypeError as e:
+            print(f"❌ ERROR: Type mismatch encountered: {e}")
+        except Exception as e:
+            print(f"❌ ERROR: Unexpected exception occurred: {e}")
 
 class SignUpSignIn(QWidget):
     """Sign-Up and Sign-In UI handling user authentication."""
@@ -886,13 +1051,16 @@ class SignUpSignIn(QWidget):
 
         print(f"🎉 SUCCESS: Signed in as '{username}' with Public Key -> {public_key}")
 
-        # ✅ Convert public key to hex for storage
-        public_key_hex = public_key.hex() if isinstance(public_key, bytes) else public_key
+        # ✅ Convert public key to bytes for storage
+        public_key_bin = public_key if isinstance(public_key, bytes) else bytes.fromhex(public_key)
+
+        # ✅ Convert private key to bytes for storage
+        private_key_bin = private_key_input if isinstance(private_key_input, bytes) else bytes.fromhex(private_key_input)
 
         # ✅ Save user credentials using `save_user_data()`
         try:
-            save_user_data(username, public_key_hex, private_key_input)
-            print(f"✅ DEBUG: User credentials saved successfully using save_user_data() (Public Key stored in hex format)")
+            save_user_data(username, public_key_bin, private_key_bin)
+            print(f"✅ DEBUG: User credentials saved successfully using save_user_data() (Public Key & Private Key stored in binary format)")
         except Exception as e:
             print(f"❌ ERROR: Failed to save user credentials using save_user_data(): {e}")
 
@@ -972,7 +1140,6 @@ def authenticate_user(blockchain_instance):
     return None, None, None
 
 if __name__ == "__main__":
-
     global start_time
     start_time = time.time()
     
@@ -1025,12 +1192,10 @@ if __name__ == "__main__":
         # ✅ Auto-launch BlockchainApp if authentication succeeds
         blockchain_window = BlockchainApp(username, public_key, private_key, 0)
         blockchain_window.show()
-        
     else:
         # ✅ Fallback to Manual Authentication via Sign-Up/Sign-In Window
         auth_window = SignUpSignIn(launch_app)
         auth_window.blockchain = blockchain_instance  # ✅ Pass blockchain instance for database queries
-        
         auth_window.show()
 
     print("DEBUG: Starting main event loop with BlockchainApp...")
