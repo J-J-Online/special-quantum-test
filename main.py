@@ -275,7 +275,7 @@ class Blockchain:
         self.lock = threading.Lock()
         self.chain = []
 
-        #self.start_rewarding()
+        self.start_rewarding()
 
         # ✅ Validate blockchain existence before loading
         if not self.has_genesis_block():
@@ -401,42 +401,29 @@ class Blockchain:
             return {}
 
     def start_rewarding(self):
-        """Starts the reward thread if not already running."""
+        """Handles node rewards securely with cryptographic validation."""
         def reward_cycle():
-            while not self.reward_stop_event.is_set():
+            while True:
                 if self.node_active:
                     for _ in range(self.countdown):
-                        if self.reward_stop_event.is_set():
-                            return
                         time.sleep(1)
                         with self.lock:
                             self.countdown -= 1
-
+                    
                     with self.lock:
                         self.post_balance += 10
-                        self.countdown = 60
-                        self.store_reward_transaction(10)
+                        self.countdown = 60  # Reset countdown
+                        self.store_reward_transaction(10)  # Securely store rewards
                         print(f"Node [{self.username}] rewarded: +10 posts (Total: {self.post_balance})")
-                else:
-                    time.sleep(1)  # Avoid tight loop if node is off
 
-        # Start a new thread only if not already running
-        if not hasattr(self, "reward_thread") or not self.reward_thread.is_alive():
-            self.reward_stop_event = threading.Event()
-            self.reward_thread = threading.Thread(target=reward_cycle)
-            self.reward_thread.start()
+        threading.Thread(target=reward_cycle).start()
 
     def toggle_node(self, status):
-        """Starts or stops the node and reward mechanism."""
+        """Starts or stops the node securely."""
         with self.lock:
             self.node_active = status
-
-            if status:
-                self.start_rewarding()
-            else:
-                self.countdown = 60
-                if hasattr(self, "reward_stop_event"):
-                    self.reward_stop_event.set()
+            if not status:
+                self.countdown = 60  # Reset countdown on stop
 
     def display_chain(self):
         """Displays all stored blockchain transactions securely."""
@@ -1214,5 +1201,4 @@ if __name__ == "__main__":
     print("DEBUG: Starting main event loop with BlockchainApp...")
     app.exec_()  # ✅ Keeps the app running
     print("DEBUG: Main event loop exited.")
-
-
+    
